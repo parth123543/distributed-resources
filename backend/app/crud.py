@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -73,15 +73,68 @@ def heartbeat_machine(db: Session, machine: models.Machine) -> models.Machine:
     return machine
 
 
+def get_stale_machines(db: Session, timeout_seconds: int) -> list[models.Machine]:
+    """
+    Find machines that are marked online but haven't sent a heartbeat
+    within the timeout window — these are presumed dead.
+
+    We check last_heartbeat IS NOT NULL to avoid flagging machines that
+    were registered but never came online (they'd have null last_heartbeat
+    and should stay 'offline', not be treated as failed machines).
+    """
+    cutoff = datetime.utcnow() - timedelta(seconds=timeout_seconds)
+    return (
+        db.query(models.Machine)
+        .filter(
+            models.Machine.status == models.MachineStatus.online,
+            models.Machine.last_heartbeat.isnot(None),
+            models.Machine.last_heartbeat < cutoff,
+        )
+        .all()
+    )
+
+
+def mark_machine_offline(db: Session, machine: models.Machine) -> models.Machine:
+    machine.status = models.MachineStatus.offline
+    db.commit()
+    db.refresh(machine)
+    return machine
+
+
+def get_running_jobs_for_machine(
+    db: Session, machine_id: uuid.UUID
+) -> list[models.Job]:
+    """
+    Find jobs that are currently 'running' on a specific machine.
+    Called after marking a machine offline — these jobs need requeueing.
+    """
+    return (
+        db.query(models.Job)
+        .filter(
+            models.Job.assigned_machine_id == machine_id,
+            models.Job.status == models.JobStatus.running,
+        )
+        .all()
+    )
+
+
+def requeue_job(db: Session, job: models.Job) -> models.Job:
+    """
+    Reset a job back to 'pending' so it can be rescheduled.
+    We clear assigned_machine_id and started_at — the job is treated
+    as if it was just submitted, so any available worker can pick it up.
+    """
+    job.status = models.JobStatus.pending
+    job.assigned_machine_id = None
+    job.started_at = None
+    db.commit()
+    db.refresh(job)
+    return job
+
+
 def create_job(
     db: Session, job_in: schemas.JobCreate, submitted_by: uuid.UUID
 ) -> models.Job:
-    """
-    Create a job record in the DB as 'pending'.
-    No machine assignment happens here — that's now the queue's job.
-    The caller (the route handler) is responsible for pushing to Redis
-    after this returns, keeping DB and queue concerns separate.
-    """
     job = models.Job(
         submitted_by=submitted_by,
         required_cpu=job_in.required_cpu,
@@ -110,14 +163,8 @@ def claim_job(
 ) -> models.Job | None:
     """
     Atomically claim a pending job for a specific machine.
-
-    Why the status check matters: two workers could theoretically pop the
-    same job_id from Redis if the queue had a bug or was manually tampered
-    with. The status check here is a second line of defense — if the job
-    is no longer 'pending' when we try to claim it, we refuse and return
-    None, so the worker knows to discard this job_id and move on.
-    This is called "optimistic locking" — we assume no conflict, but
-    verify before committing.
+    Returns None if the job is no longer pending (already claimed elsewhere).
+    This is our optimistic locking / double-claim prevention.
     """
     if job.status != models.JobStatus.pending:
         return None

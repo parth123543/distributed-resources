@@ -76,38 +76,59 @@ def get_machine_specs() -> dict:
         "os": f"{platform.system()} {platform.release()}",
     }
 
-
-def load_saved_machine_id() -> str | None:
+def load_machine_state() -> dict | None:
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
-            return json.load(f).get("machine_id")
+            return json.load(f)
     return None
 
 
-def save_machine_id(machine_id: str) -> None:
+def save_machine_state(machine_id: str, specs: dict) -> None:
     with open(STATE_FILE, "w") as f:
-        json.dump({"machine_id": machine_id}, f)
+        json.dump({"machine_id": machine_id, "specs": specs}, f)
+
+def fetch_job_requirements(token: str, job_id: str) -> dict | None:
+    """
+    Inspect a job's requirements before deciding to claim it.
+    Returns None if the job is no longer available (already claimed,
+    deleted, etc.) — worker should skip and move on.
+    """
+    try:
+        response = requests.get(
+            f"{settings.api_base_url}/jobs/{job_id}/requirements",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status_code == 404:
+            logger.info(f"Job {job_id} no longer exists. Skipping.")
+            return None
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch requirements for job {job_id}: {e}")
+        return None
 
 
-def register_machine(token: str) -> str:
-    existing_id = load_saved_machine_id()
-    if existing_id:
-        logger.info(f"Reusing existing machine registration: {existing_id}")
-        return existing_id
+def can_handle_job(machine_specs: dict, job: dict) -> bool:
+    """
+    Check if this machine meets the job's minimum resource requirements.
 
-    specs = get_machine_specs()
-    response = requests.post(
-        f"{settings.api_base_url}/machines",
-        json=specs,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
-    )
-    response.raise_for_status()
-    machine = response.json()
-    save_machine_id(machine["id"])
-    logger.info(f"Registered new machine: {machine['id']}")
-    return machine["id"]
+    Why we check here and not just rely on the claim endpoint:
+    Claiming is a write operation — it marks the job as 'running' in
+    the DB. If we claim a job we can't run, we've locked it to a machine
+    that will fail, and failure detection has to clean it up. Better to
+    never claim it in the first place.
+    """
+    has_cpu = machine_specs["cpu_cores"] >= job["required_cpu"]
+    has_ram = machine_specs["ram_gb"] >= job["required_ram"]
 
+    # GPU check: if job requires a specific GPU, machine must have one.
+    # If job has no GPU requirement, any machine qualifies.
+    has_gpu = True
+    if job.get("required_gpu"):
+        has_gpu = machine_specs.get("gpu_info") is not None
+
+    return has_cpu and has_ram and has_gpu
 
 # ---------------------------------------------------------------------------
 # Heartbeat
@@ -194,18 +215,22 @@ def execute_job_in_docker(command: str) -> tuple[str, bool]:
     except Exception as e:
         return str(e), True
 
-def process_one_job(token: str, machine_id: str) -> None:
+def process_one_job(token: str, machine_id: str, machine_specs: dict) -> None:
     """
-    Block on Redis until a job arrives, then claim, execute, report.
-    Handles TimeoutError gracefully — it just means no job arrived
-    during this BRPOP cycle, which is normal during idle periods.
+    Full resource-aware job processing cycle:
+    1. Block on Redis queue (BRPOP)
+    2. Inspect job requirements
+    3. If this machine can handle it → claim and execute
+    4. If not → push back to queue, back off briefly, continue
+
+    The backoff on step 4 is important: without it, a worker that can't
+    handle any available jobs would spin in a tight loop, burning CPU
+    and hammering Redis — exactly what we want to avoid.
     """
     try:
         logger.info("Waiting for job from queue...")
         result = redis_client.brpop(JOBS_QUEUE_KEY, timeout=30)
     except redis.exceptions.TimeoutError:
-        # Socket timeout fired before BRPOP timeout — perfectly normal,
-        # just means the queue was empty. Loop back and wait again.
         logger.debug("BRPOP cycle timed out (queue idle). Looping back.")
         return
 
@@ -215,14 +240,114 @@ def process_one_job(token: str, machine_id: str) -> None:
     _, job_id = result
     logger.info(f"Popped job {job_id} from queue.")
 
-    job = claim_job(token, job_id, machine_id)
+    # Step 1: inspect requirements before claiming
+    job = fetch_job_requirements(token, job_id)
     if job is None:
+        # Job disappeared (deleted, already completed) — discard and move on
         return
 
-    logger.info(f"Executing: {job['command']}")
-    output, failed = execute_job_in_docker(job["command"])
+    if job["status"] != "pending":
+        logger.info(f"Job {job_id} is no longer pending (status={job['status']}). Skipping.")
+        return
+
+    # Step 2: check if this machine can handle the job
+    if not can_handle_job(machine_specs, job):
+        logger.warning(
+            f"Job {job_id} requires {job['required_cpu']} cores / "
+            f"{job['required_ram']}GB RAM — this machine has "
+            f"{machine_specs['cpu_cores']} cores / {machine_specs['ram_gb']}GB RAM. "
+            f"Pushing back to queue."
+        )
+        # Push back to the END of the queue (RPUSH = right push) so other
+        # workers get a chance before we see this job again.
+        redis_client.rpush(JOBS_QUEUE_KEY, job_id)
+
+        # Back off briefly to avoid a tight loop if we're the only worker
+        # and can't handle any jobs currently in the queue.
+        import time
+        time.sleep(5)
+        return
+
+    # Step 3: claim the job
+    claimed = claim_job(token, job_id, machine_id)
+    if claimed is None:
+        return  # someone else claimed it first — move on
+
+    # Step 4: execute and report
+    logger.info(f"Executing: {claimed['command']}")
+    output, failed = execute_job_in_docker(claimed["command"])
     report_job_result(token, job_id, output, failed)
     logger.info(f"Job {job_id} {'FAILED' if failed else 'completed'}.")
+
+
+def register_machine(token: str) -> tuple[str, dict]:
+    """
+    Returns (machine_id, specs) tuple.
+    Specs are saved locally so the worker can check job compatibility
+    without an extra API call on every queue cycle.
+    """
+    state = load_machine_state()
+    if state and "machine_id" in state and "specs" in state:
+        logger.info(f"Reusing existing machine registration: {state['machine_id']}")
+        return state["machine_id"], state["specs"]
+
+    specs = get_machine_specs()
+    response = requests.post(
+        f"{settings.api_base_url}/machines",
+        json=specs,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    machine = response.json()
+    save_machine_state(machine["id"], specs)
+    logger.info(f"Registered new machine: {machine['id']}")
+    logger.info(f"Specs: {specs['cpu_cores']} cores, {specs['ram_gb']}GB RAM, OS: {specs['os']}")
+    return machine["id"], specs
+
+
+def fetch_job_requirements(token: str, job_id: str) -> dict | None:
+    """
+    Inspect a job's requirements before deciding to claim it.
+    Returns None if the job is no longer available (already claimed,
+    deleted, etc.) — worker should skip and move on.
+    """
+    try:
+        response = requests.get(
+            f"{settings.api_base_url}/jobs/{job_id}/requirements",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if response.status_code == 404:
+            logger.info(f"Job {job_id} no longer exists. Skipping.")
+            return None
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch requirements for job {job_id}: {e}")
+        return None
+
+
+def can_handle_job(machine_specs: dict, job: dict) -> bool:
+    """
+    Check if this machine meets the job's minimum resource requirements.
+
+    Why we check here and not just rely on the claim endpoint:
+    Claiming is a write operation — it marks the job as 'running' in
+    the DB. If we claim a job we can't run, we've locked it to a machine
+    that will fail, and failure detection has to clean it up. Better to
+    never claim it in the first place.
+    """
+    has_cpu = machine_specs["cpu_cores"] >= job["required_cpu"]
+    has_ram = machine_specs["ram_gb"] >= job["required_ram"]
+
+    # GPU check: if job requires a specific GPU, machine must have one.
+    # If job has no GPU requirement, any machine qualifies.
+    has_gpu = True
+    if job.get("required_gpu"):
+        has_gpu = machine_specs.get("gpu_info") is not None
+
+    return has_cpu and has_ram and has_gpu
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +357,14 @@ def process_one_job(token: str, machine_id: str) -> None:
 def main():
     logger.info("Starting worker agent...")
     token = get_access_token()
-    machine_id = register_machine(token)
+    machine_id, machine_specs = register_machine(token)
+
+    logger.info(
+        f"This machine: {machine_specs['cpu_cores']} cores, "
+        f"{machine_specs['ram_gb']}GB RAM, "
+        f"GPU: {machine_specs.get('gpu_info') or 'none'}"
+    )
+
     send_heartbeat(token, machine_id)
 
     logger.info("Entering main loop. Press Ctrl+C to stop.")
@@ -240,12 +372,8 @@ def main():
 
     try:
         while True:
-            process_one_job(token, machine_id)
+            process_one_job(token, machine_id, machine_specs)
 
-            # Send a heartbeat if enough time has passed since the last one.
-            # This runs after each BRPOP cycle (which blocks up to 30s),
-            # so heartbeats fire at most every ~30s rather than exactly
-            # every HEARTBEAT_INTERVAL_SECONDS — acceptable for now.
             now = time.time()
             if now - last_heartbeat >= settings.heartbeat_interval_seconds:
                 send_heartbeat(token, machine_id)

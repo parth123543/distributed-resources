@@ -87,6 +87,16 @@ class JobOut(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+class JobRequirements(BaseModel):
+    id: uuid.UUID
+    required_cpu: int
+    required_ram: float
+    required_gpu: Optional[str]
+    priority: int
+    status: JobStatus
+
+    model_config = ConfigDict(from_attributes=True)
+
 class JobComplete(BaseModel):
     result_output: str
     failed: bool = False

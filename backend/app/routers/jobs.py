@@ -64,6 +64,24 @@ def delete_job(
     db.commit()
 
 
+
+@router.get("/{job_id}/requirements", response_model=schemas.JobRequirements)
+def get_job_requirements(
+    job_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    """
+    Lets a worker inspect a job's resource requirements before deciding
+    whether to claim it. This is the key to resource-aware scheduling:
+    pop from queue → inspect → claim if capable, push back if not.
+    """
+    job = crud.get_job_by_id(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    return job
+
+
 @router.post("/{job_id}/claim", response_model=schemas.JobOut)
 def claim_job(
     job_id: uuid.UUID,
@@ -86,7 +104,7 @@ def claim_job(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Machine not found or not yours.",
         )
-
+    
     claimed = crud.claim_job(db, job, claim.machine_id)
     if claimed is None:
         raise HTTPException(

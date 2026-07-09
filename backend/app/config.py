@@ -2,7 +2,6 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Always load from backend/.env regardless of where the process was started from
 ENV_FILE = Path(__file__).parent.parent / ".env"
 
 
@@ -12,6 +11,8 @@ class Settings(BaseSettings):
     jwt_secret: str
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
+    heartbeat_timeout_seconds: int = 60
+    failure_check_interval_seconds: int = 30
 
     model_config = SettingsConfigDict(
         env_file=str(ENV_FILE),
