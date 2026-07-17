@@ -1,0 +1,45 @@
+version: "3.9"
+
+# Lightweight dev override — only runs infrastructure
+# Backend and worker run locally via venv (faster iteration)
+networks:
+  dr_network:
+    driver: bridge
+
+volumes:
+  pgdata:
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: dr_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dr_user
+      POSTGRES_PASSWORD: dr_password
+      POSTGRES_DB: distributed_resources
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - dr_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dr_user -d distributed_resources"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: dr_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - dr_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

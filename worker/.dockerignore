@@ -1,0 +1,6 @@
+__pycache__
+*.pyc
+.env
+.env.production
+venv/
+machine_state.json
