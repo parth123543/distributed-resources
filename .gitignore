@@ -1,12 +1,13 @@
 __pycache__/
 *.pyc
 .env
+.env.production
 node_modules/
 frontend/node_modules/
 frontend/.next/
 .next/
-infra/pgdata
 venv/
 *.egg-info
 worker/machine_state.json
-.env.production
+*.lock~
+.gitignore~

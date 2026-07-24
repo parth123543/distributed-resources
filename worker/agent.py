@@ -1,3 +1,13 @@
+"""
+Worker Agent for Distributed Resources platform.
+
+Responsibilities:
+1. Register this machine with the backend (once, idempotent via state file).
+2. Send periodic heartbeats so the backend knows we're alive.
+3. Publish real-time metrics to Redis pub/sub every METRICS_INTERVAL seconds.
+4. Block on Redis queue waiting for jobs.
+5. Inspect job requirements, claim if capable, execute in Docker, report result.
+"""
 import json
 import logging
 import platform
@@ -31,6 +41,10 @@ redis_client = redis.from_url(
 )
 
 
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
 def get_access_token() -> str:
     response = requests.post(
         f"{settings.api_base_url}/auth/login",
@@ -44,6 +58,10 @@ def get_access_token() -> str:
     logger.info("Authenticated with backend successfully.")
     return response.json()["access_token"]
 
+
+# ---------------------------------------------------------------------------
+# Machine registration
+# ---------------------------------------------------------------------------
 
 def get_machine_specs() -> dict:
     return {
@@ -86,6 +104,10 @@ def register_machine(token: str) -> tuple[str, dict]:
     return machine["id"], specs
 
 
+# ---------------------------------------------------------------------------
+# Heartbeat
+# ---------------------------------------------------------------------------
+
 def send_heartbeat(token: str, machine_id: str, max_retries: int = 3) -> bool:
     for attempt in range(1, max_retries + 1):
         try:
@@ -106,6 +128,10 @@ def send_heartbeat(token: str, machine_id: str, max_retries: int = 3) -> bool:
     logger.error("All heartbeat attempts failed.")
     return False
 
+
+# ---------------------------------------------------------------------------
+# Resource checking
+# ---------------------------------------------------------------------------
 
 def fetch_job_requirements(token: str, job_id: str) -> dict | None:
     try:
@@ -132,6 +158,10 @@ def can_handle_job(machine_specs: dict, job: dict) -> bool:
         has_gpu = machine_specs.get("gpu_info") is not None
     return has_cpu and has_ram and has_gpu
 
+
+# ---------------------------------------------------------------------------
+# Job execution
+# ---------------------------------------------------------------------------
 
 def claim_job(token: str, job_id: str, machine_id: str) -> dict | None:
     try:
@@ -214,7 +244,7 @@ def process_one_job(token: str, machine_id: str, machine_specs: dict) -> None:
             f"{machine_specs['cpu_cores']} cores / "
             f"{machine_specs['ram_gb']}GB RAM. Pushing back."
         )
-        redis_client.rpush(JOBS_QUEUE_KEY, job_id)
+        redis_client.rpush(JOBS_QUEUE_KEY, job_i
         time.sleep(5)
         return
 
@@ -224,9 +254,13 @@ def process_one_job(token: str, machine_id: str, machine_specs: dict) -> None:
 
     logger.info(f"Executing: {claimed['command']}")
     output, failed = execute_job_in_docker(claimed["command"])
-    reportob_result(token, job_id, output, failed)
+    report_job_result(token, job_id, output, failed)
     logger.info(f"Job {job_id} {'FAILED' if failed else 'completed'}.")
 
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main():
     logger.info("Starting worker agent...")
