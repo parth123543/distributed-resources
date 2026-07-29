@@ -87,7 +87,7 @@ jobs:
 
   notify:
     name: Pipeline Status
-    runs-on: ubuu-latest
+    runs-on: ubuntu-latest
     needs: [backend-tests, frontend-build]
     if: always()
 
