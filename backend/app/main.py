@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from prometheus_fastapi_instrumentator import Instrumentator
 
+from app.database import engine, Base
 from app.failure_detector import run_failure_detector
 from app.routers import auth, machines, jobs, metrics
 
@@ -13,9 +14,15 @@ logger = logging.getLogger("main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create all tables directly — no alembic needed in production
+    logger.info("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables ready.")
+
     logger.info("Starting background services...")
     detector_task = asyncio.create_task(run_failure_detector())
     yield
+
     logger.info("Shutting down background services...")
     detector_task.cancel()
     try:
